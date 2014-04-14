@@ -1,0 +1,170 @@
+From ede2d591253a9a483ec3459a8603d2df4b84eac7 Mon Sep 17 00:00:00 2001
+From: Amelek <amelek@invalid>
+Date: Mon, 14 Apr 2014 19:00:39 +0200
+Subject: [PATCH] refactor & change tls1_process_heartbeat to be compilant
+ with RFC 6520
+
+---
+ ssl/t1_lib.c | 125 +++++++++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 79 insertions(+), 46 deletions(-)
+
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index bcb99b8..06e54af 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -3961,73 +3961,106 @@ int SSL_get_shared_sigalgs(SSL *s, int idx,
+ 	
+ 
+ #ifndef OPENSSL_NO_HEARTBEATS
++#define RFC_6520_TYPE_FIELD_LENGTH 1
++#define RFC_6520_PAYLOAD_SIZE_FIELD_LENGTH 2
++#define RFC_6520_HEADER_LENGTH (RFC_6520_TYPE_FIELD_LENGTH + RFC_6520_PAYLOAD_SIZE_FIELD_LENGTH)
++#define RFC_6520_MINIMAL_PADDING_LENGTH 16
++#define RFC_6520_MINIMAL_REQUEST_LENGTH (RFC_6520_HEADER_LENGTH + RFC_6520_MINIMAL_PADDING_LENGTH) /* Assume that content was empty */
++#define RFC_6520_MAXIMAL_REQUEST_LENGTH (1 << 14) /* RFC 6520 sec. 4 specifies that the length of whole message must not exceed 2 ^ 14 */
++
++#define OPENSSL_DEFAULT_HEARTBEAT_CONTENT_LENGTH 18 /* We use 2 byte sequence number followed by 16 random bytes, see tls1_heartbeat */
+ int
+-tls1_process_heartbeat(SSL *s)
++tls1_process_heartbeat(SSL *context)
+ 	{
+-	unsigned char *p = &s->s3->rrec.data[0], *pl;
+-	unsigned short hbtype;
+-	unsigned int payload;
+-	unsigned int padding = 16; /* Use minimum padding */
++	unsigned char *request;
++	unsigned int request_length;
++	unsigned short heartbeat_type;
++	unsigned int payload_length;
++
++	if (context->msg_callback)
++		context->msg_callback(0, context->version, TLS1_RT_HEARTBEAT,
++			&context->s3->rrec.data[0], context->s3->rrec.length,
++			context, context->msg_callback_arg);
++
++	request = &context->s3->rrec.data[0];
++	request_length = context->s3->rrec.length;
+ 
+-	if (s->msg_callback)
+-		s->msg_callback(0, s->version, TLS1_RT_HEARTBEAT,
+-			&s->s3->rrec.data[0], s->s3->rrec.length,
+-			s, s->msg_callback_arg);
+-
+-	/* Read type and payload length first */
+-	if (1 + 2 + 16 > s->s3->rrec.length)
+-		return 0; /* silently discard */
+-	hbtype = *p++;
+-	n2s(p, payload);
+-	if (1 + 2 + payload + 16 > s->s3->rrec.length)
++	/* Discard any requests that are too short */
++	if (RFC_6520_MINIMAL_REQUEST_LENGTH > context->s3->rrec.length)
++		return 0;
++	
++	/* Discard any requests that are too long */
++	if (RFC_6520_MAXIMAL_REQUEST_LENGTH > context->s3->rrec.length)
++		return 0;
++
++	/* Decode request header as specified in RFC 6520 sec. 4 */
++	heartbeat_type = *request++;
++	n2s(request, payload_length);
++
++	/* RFC 6520 specifies that request contain two buffers of varied length: payload and padding.
++	* Padding length is defiend as reminder of submited data and payload_length and must
++	* be at least 16 bytes
++	*/
++	if (RFC_6520_MINIMAL_REQUEST_LENGTH + payload_length > context->s3->rrec.length)
+ 		return 0; /* silently discard per RFC 6520 sec. 4 */
+-	pl = p;
+ 
+-	if (hbtype == TLS1_HB_REQUEST)
++	if (heartbeat_type == TLS1_HB_REQUEST)
+ 		{
+-		unsigned char *buffer, *bp;
+-		int r;
++		unsigned char *response;
++		unsigned char *response_ptr;
++		unsigned int response_length = RFC_6520_HEADER_LENGTH + RFC_6520_MINIMAL_PADDING_LENGTH + payload_length;
++		int ret;
+ 
+-		/* Allocate memory for the response, size is 1 bytes
+-		 * message type, plus 2 bytes payload length, plus
+-		 * payload, plus padding
+-		 */
+-		buffer = OPENSSL_malloc(1 + 2 + payload + padding);
+-		bp = buffer;
++		response = OPENSSL_malloc(response_length);
++		/* RFC 6520 does not specify how server should respond when request can't be completed */
++		if(response == NULL)
++			return 0; /* silently discard */
++
++		response_ptr = response;
++		
++		/* Fill message headers */
++		*response_ptr++ = TLS1_HB_RESPONSE;
++		s2n(payload_length, response_ptr);
+ 		
+-		/* Enter response type, length and copy payload */
+-		*bp++ = TLS1_HB_RESPONSE;
+-		s2n(payload, bp);
+-		memcpy(bp, pl, payload);
+-		bp += payload;
+-		/* Random padding */
+-		RAND_pseudo_bytes(bp, padding);
++		/* Copy payload */
++		memcpy(response_ptr, request, payload_length);
++		response_ptr += payload_length;
+ 
+-		r = ssl3_write_bytes(s, TLS1_RT_HEARTBEAT, buffer, 3 + payload + padding);
++		/* Fill padding */
++		ret = RAND_pseudo_bytes(response_ptr, RFC_6520_MINIMAL_PADDING_LENGTH);
++		if(ret < 0)
++			{
++			OPENSSL_free(response);
++			return ret;
++			}
+ 
+-		if (r >= 0 && s->msg_callback)
+-			s->msg_callback(1, s->version, TLS1_RT_HEARTBEAT,
+-				buffer, 3 + payload + padding,
+-				s, s->msg_callback_arg);
++		/* Send the data */
++		ret = ssl3_write_bytes(context, TLS1_RT_HEARTBEAT, response, response_length);
+ 
+-		OPENSSL_free(buffer);
++		/* If send successed and callback is defined, invoke it now */
++		if (ret >= 0 && context->msg_callback)
++			context->msg_callback(1, context->version, TLS1_RT_HEARTBEAT,
++				response, response_length,
++				context, context->msg_callback_arg);
+ 
+-		if (r < 0)
+-			return r;
++		OPENSSL_free(response);
++
++		if (ret < 0)
++			return ret;
+ 		}
+-	else if (hbtype == TLS1_HB_RESPONSE)
++	else if (heartbeat_type == TLS1_HB_RESPONSE)
+ 		{
+ 		unsigned int seq;
+ 		
+ 		/* We only send sequence numbers (2 bytes unsigned int),
+ 		 * and 16 random bytes, so we just try to read the
+ 		 * sequence number */
+-		n2s(pl, seq);
++		n2s(request, seq);
+ 		
+-		if (payload == 18 && seq == s->tlsext_hb_seq)
++		if (payload_length == OPENSSL_DEFAULT_HEARTBEAT_CONTENT_LENGTH && seq == context->tlsext_hb_seq)
+ 			{
+-			s->tlsext_hb_seq++;
+-			s->tlsext_hb_pending = 0;
++			context->tlsext_hb_seq++;
++			context->tlsext_hb_pending = 0;
+ 			}
+ 		}
+ 
+-- 
+1.8.0.msysgit.0
+
