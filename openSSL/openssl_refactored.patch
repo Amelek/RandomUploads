@@ -1,6 +1,6 @@
-From ede2d591253a9a483ec3459a8603d2df4b84eac7 Mon Sep 17 00:00:00 2001
+From f5d938199ef1d449d3c9a2de261d24892c92b779 Mon Sep 17 00:00:00 2001
 From: Amelek <amelek@invalid>
-Date: Mon, 14 Apr 2014 19:00:39 +0200
+Date: Mon, 14 Apr 2014 19:13:42 +0200
 Subject: [PATCH] refactor & change tls1_process_heartbeat to be compilant
  with RFC 6520
 
@@ -9,7 +9,7 @@ Subject: [PATCH] refactor & change tls1_process_heartbeat to be compilant
  1 file changed, 79 insertions(+), 46 deletions(-)
 
 diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
-index bcb99b8..06e54af 100644
+index bcb99b8..e49c685 100644
 --- a/ssl/t1_lib.c
 +++ b/ssl/t1_lib.c
 @@ -3961,73 +3961,106 @@ int SSL_get_shared_sigalgs(SSL *s, int idx,
@@ -61,7 +61,7 @@ index bcb99b8..06e54af 100644
 +		return 0;
 +	
 +	/* Discard any requests that are too long */
-+	if (RFC_6520_MAXIMAL_REQUEST_LENGTH > context->s3->rrec.length)
++	if (RFC_6520_MAXIMAL_REQUEST_LENGTH < context->s3->rrec.length)
 +		return 0;
 +
 +	/* Decode request header as specified in RFC 6520 sec. 4 */
